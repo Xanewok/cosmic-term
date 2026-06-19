@@ -3066,10 +3066,9 @@ impl Application for App {
                             && let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity)
                         {
                             let terminal = terminal.lock().unwrap();
-                            if let Some(rgb) = terminal.effective_color(index) {
-                                let text = f(rgb);
-                                terminal.input_no_scroll(text.into_bytes());
-                            }
+                            let rgb = terminal.effective_color(index);
+                            let text = f(rgb);
+                            terminal.input_no_scroll(text.into_bytes());
                         }
                     }
                     TermEvent::CursorBlinkingChange => {

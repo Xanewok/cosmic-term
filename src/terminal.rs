@@ -124,17 +124,31 @@ fn as_dim(mut color: Color) -> Color {
 
 pub static WINDOW_BG_COLOR: AtomicU32 = AtomicU32::new(0xFF000000);
 
+fn window_bg_color() -> Rgb {
+    let color = cosmic_text::Color(WINDOW_BG_COLOR.load(Ordering::SeqCst));
+    Rgb {
+        r: color.r(),
+        g: color.g(),
+        b: color.b(),
+    }
+}
+
 fn effective_color(colors: &Colors, index: usize) -> Option<Rgb> {
-    colors[index].or_else(|| {
-        (index == NamedColor::Background as usize).then(|| {
-            let color = cosmic_text::Color(WINDOW_BG_COLOR.load(Ordering::SeqCst));
-            Rgb {
-                r: color.r(),
-                g: color.g(),
-                b: color.b(),
-            }
-        })
-    })
+    match colors[index] {
+        Some(color) => Some(color),
+        None if index == NamedColor::Background as usize => Some(window_bg_color()),
+        None => None,
+    }
+}
+
+fn colors_with_default_overrides(colors: &Colors, overrides: &Colors) -> Colors {
+    let mut colors = *colors;
+    for named_color in [NamedColor::Foreground, NamedColor::Background] {
+        if overrides[named_color].is_some() {
+            colors[named_color] = overrides[named_color];
+        }
+    }
+    colors
 }
 
 fn convert_color(colors: &Colors, color: Color) -> cosmic_text::Color {
@@ -394,8 +408,10 @@ impl Terminal {
         &self.colors
     }
 
-    pub fn effective_color(&self, index: usize) -> Option<Rgb> {
-        effective_color(&self.colors, index)
+    pub fn effective_color(&self, index: usize) -> Rgb {
+        self.term.lock().colors()[index]
+            .or_else(|| effective_color(&self.colors, index))
+            .unwrap_or_default()
     }
 
     pub fn default_attrs(&self) -> &Attrs<'static> {
@@ -685,7 +701,8 @@ impl Terminal {
 
         // NOTE: this is done on every set_config because the changed boolean above does not capture
         // WINDOW_BG changes
-        let default_colors_updated = self.update_default_colors(config);
+        let colors = self.colors;
+        let default_colors_updated = self.update_default_colors(&colors);
 
         if update_cell_size {
             self.update_cell_size();
@@ -694,9 +711,9 @@ impl Terminal {
         }
     }
 
-    pub fn update_default_colors(&mut self, config: &AppConfig) -> bool {
-        let default_bg = convert_color(&self.colors, Color::Named(NamedColor::Background));
-        let default_fg = convert_color(&self.colors, Color::Named(NamedColor::Foreground));
+    pub fn update_default_colors(&mut self, colors: &Colors) -> bool {
+        let default_bg = convert_color(colors, Color::Named(NamedColor::Background));
+        let default_fg = convert_color(colors, Color::Named(NamedColor::Foreground));
 
         let new_default_metadata = Metadata::new(default_bg, default_fg);
         let curr_metada_idx = self.default_attrs().metadata;
@@ -709,8 +726,8 @@ impl Terminal {
 
             self.default_attrs = Attrs::new()
                 .family(Family::Monospace)
-                .weight(Weight(config.font_weight))
-                .stretch(config.typed_font_stretch())
+                .weight(self.default_attrs.weight)
+                .stretch(self.default_attrs.stretch)
                 .color(default_fg)
                 .metadata(default_metadata_idx);
         }
@@ -755,6 +772,12 @@ impl Terminal {
 
         let instant = Instant::now();
 
+        let term = Arc::clone(&self.term);
+        let mut term = term.lock();
+        // Runtime colors, damage, and grid contents must come from the same terminal state.
+        let colors = colors_with_default_overrides(&self.colors, term.colors());
+        self.update_default_colors(&colors);
+
         // Only keep default
         self.metadata_set.truncate(1);
 
@@ -768,7 +791,6 @@ impl Terminal {
             let mut text = String::from(LRI);
             let mut attrs_list = AttrsList::new(&self.default_attrs);
             {
-                let mut term = self.term.lock();
                 //TODO: use damage?
                 match term.damage() {
                     TermDamage::Full => {}
@@ -845,13 +867,13 @@ impl Terminal {
 
                     let (mut fg, mut bg) = if indexed.cell.flags.contains(Flags::INVERSE) {
                         (
-                            convert_color(&self.colors, indexed.cell.bg),
-                            convert_color(&self.colors, cell_fg),
+                            convert_color(&colors, indexed.cell.bg),
+                            convert_color(&colors, cell_fg),
                         )
                     } else {
                         (
-                            convert_color(&self.colors, cell_fg),
-                            convert_color(&self.colors, indexed.cell.bg),
+                            convert_color(&colors, cell_fg),
+                            convert_color(&colors, indexed.cell.bg),
                         )
                     };
 
@@ -887,8 +909,8 @@ impl Terminal {
                         };
                         let contrast = fg_rgb.contrast(bg_rgb);
                         if contrast < MIN_CURSOR_CONTRAST {
-                            fg = convert_color(&self.colors, Color::Named(NamedColor::Background));
-                            bg = convert_color(&self.colors, Color::Named(NamedColor::Foreground));
+                            fg = convert_color(&colors, Color::Named(NamedColor::Background));
+                            bg = convert_color(&colors, Color::Named(NamedColor::Foreground));
                         }
                     }
 
@@ -907,7 +929,7 @@ impl Terminal {
                     let underline_color = indexed
                         .cell
                         .underline_color()
-                        .map(|c| convert_color(&self.colors, c))
+                        .map(|c| convert_color(&colors, c))
                         .unwrap_or(fg);
 
                     let mut flags = indexed.cell.flags;
@@ -964,6 +986,7 @@ impl Terminal {
                     last_point = Some(indexed.point);
                 }
             }
+            drop(term);
 
             //TODO: do not repeat!
             while line_i >= buffer.lines.len() {
@@ -1263,39 +1286,44 @@ impl Drop for Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::colors_with_default_overrides;
+    use alacritty_terminal::{
+        term::color::{self, Colors},
+        vte::ansi::{NamedColor, Rgb},
+    };
 
     #[test]
-    fn effective_color_uses_explicit_colors_and_live_background_fallback() {
-        let original_background =
-            WINDOW_BG_COLOR.swap(cosmic_text::Color::rgb(1, 2, 3).0, Ordering::SeqCst);
-        let mut colors = Colors::default();
+    fn default_color_overrides_only_replace_foreground_and_background() {
+        let mut configured = Colors::default();
+        configured[NamedColor::Foreground] = Some(Rgb { r: 1, g: 2, b: 3 });
+        configured[NamedColor::Background] = Some(Rgb { r: 4, g: 5, b: 6 });
+        configured[NamedColor::Cursor] = Some(Rgb { r: 7, g: 8, b: 9 });
 
-        assert_eq!(
-            effective_color(&colors, NamedColor::Background as usize),
-            Some(Rgb { r: 1, g: 2, b: 3 })
-        );
-
-        WINDOW_BG_COLOR.store(cosmic_text::Color::rgb(4, 5, 6).0, Ordering::SeqCst);
-        assert_eq!(
-            effective_color(&colors, NamedColor::Background as usize),
-            Some(Rgb { r: 4, g: 5, b: 6 })
-        );
-
-        colors[NamedColor::Background] = Some(Rgb {
-            r: 100,
-            g: 101,
-            b: 102,
+        let mut overrides = Colors::default();
+        overrides[NamedColor::Foreground] = Some(Rgb { r: 255, g: 0, b: 0 });
+        overrides[NamedColor::Background] = Some(Rgb {
+            r: 128,
+            g: 0,
+            b: 128,
         });
-        assert_eq!(
-            effective_color(&colors, NamedColor::Background as usize),
-            colors[NamedColor::Background]
-        );
-        assert_eq!(
-            effective_color(&colors, NamedColor::Foreground as usize),
-            None
-        );
+        overrides[NamedColor::Cursor] = Some(Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        });
 
-        WINDOW_BG_COLOR.store(original_background, Ordering::SeqCst);
+        let mut expected = configured;
+        expected[NamedColor::Foreground] = overrides[NamedColor::Foreground];
+        expected[NamedColor::Background] = overrides[NamedColor::Background];
+
+        let colors = colors_with_default_overrides(&configured, &overrides);
+        for index in 0..color::COUNT {
+            assert_eq!(colors[index], expected[index]);
+        }
+
+        let colors = colors_with_default_overrides(&configured, &Colors::default());
+        for index in 0..color::COUNT {
+            assert_eq!(colors[index], configured[index]);
+        }
     }
 }
