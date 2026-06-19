@@ -124,18 +124,26 @@ fn as_dim(mut color: Color) -> Color {
 
 pub static WINDOW_BG_COLOR: AtomicU32 = AtomicU32::new(0xFF000000);
 
+fn effective_color(colors: &Colors, index: usize) -> Option<Rgb> {
+    colors[index].or_else(|| {
+        (index == NamedColor::Background as usize).then(|| {
+            let color = cosmic_text::Color(WINDOW_BG_COLOR.load(Ordering::SeqCst));
+            Rgb {
+                r: color.r(),
+                g: color.g(),
+                b: color.b(),
+            }
+        })
+    })
+}
+
 fn convert_color(colors: &Colors, color: Color) -> cosmic_text::Color {
     let rgb = match color {
-        Color::Named(named_color) => match colors[named_color] {
+        Color::Named(named_color) => match effective_color(colors, named_color as usize) {
             Some(rgb) => rgb,
             None => {
-                if named_color == NamedColor::Background {
-                    // Allow using an unset background
-                    return cosmic_text::Color(WINDOW_BG_COLOR.load(Ordering::SeqCst));
-                } else {
-                    log::warn!("missing named color {:?}", named_color);
-                    Rgb::default()
-                }
+                log::warn!("missing named color {:?}", named_color);
+                Rgb::default()
             }
         },
         Color::Spec(rgb) => rgb,
@@ -384,6 +392,10 @@ impl Terminal {
 
     pub fn colors(&self) -> &Colors {
         &self.colors
+    }
+
+    pub fn effective_color(&self, index: usize) -> Option<Rgb> {
+        effective_color(&self.colors, index)
     }
 
     pub fn default_attrs(&self) -> &Attrs<'static> {
@@ -1246,5 +1258,44 @@ impl Drop for Terminal {
         if let Err(err) = self.notifier.0.send(Msg::Shutdown) {
             log::warn!("Failed to send shutdown message on dropped terminal: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_color_uses_explicit_colors_and_live_background_fallback() {
+        let original_background =
+            WINDOW_BG_COLOR.swap(cosmic_text::Color::rgb(1, 2, 3).0, Ordering::SeqCst);
+        let mut colors = Colors::default();
+
+        assert_eq!(
+            effective_color(&colors, NamedColor::Background as usize),
+            Some(Rgb { r: 1, g: 2, b: 3 })
+        );
+
+        WINDOW_BG_COLOR.store(cosmic_text::Color::rgb(4, 5, 6).0, Ordering::SeqCst);
+        assert_eq!(
+            effective_color(&colors, NamedColor::Background as usize),
+            Some(Rgb { r: 4, g: 5, b: 6 })
+        );
+
+        colors[NamedColor::Background] = Some(Rgb {
+            r: 100,
+            g: 101,
+            b: 102,
+        });
+        assert_eq!(
+            effective_color(&colors, NamedColor::Background as usize),
+            colors[NamedColor::Background]
+        );
+        assert_eq!(
+            effective_color(&colors, NamedColor::Foreground as usize),
+            None
+        );
+
+        WINDOW_BG_COLOR.store(original_background, Ordering::SeqCst);
     }
 }
