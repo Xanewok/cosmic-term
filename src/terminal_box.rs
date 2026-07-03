@@ -900,7 +900,7 @@ where
                     }
                 }
                 cosmic::iced::window::Event::RedrawRequested(_) => {
-                    if is_mouse_mode {
+                    if is_mouse_mode && state.mouse_reported {
                         state.autoscroll.stop();
                     } else {
                         if let Some((pointer, multiplier)) = state.autoscroll.next_due()
@@ -1235,7 +1235,15 @@ where
                     let col = x / terminal.size().cell_width;
                     let row = y / terminal.size().cell_height;
 
-                    if is_mouse_mode {
+                    // Shift reserves this gesture for native selection while an app grabs
+                    // the mouse (matches xterm/alacritty); latch the decision so a mid-gesture
+                    // Shift change can't split a reported press from a bypassed release. An open
+                    // context menu also takes the native path so the click dismisses it rather
+                    // than being forwarded to the app.
+                    let report =
+                        self.context_menu.is_none() && is_mouse_mode && !state.modifiers.shift();
+                    state.mouse_reported = report;
+                    if report {
                         state.autoscroll.stop();
                         terminal.report_mouse(
                             event.clone(),
@@ -1419,7 +1427,7 @@ where
                         shell.capture_event();
                     }
 
-                    if is_mouse_mode {
+                    if is_mouse_mode && state.mouse_reported {
                         terminal.report_mouse(
                             event.clone(),
                             &state.modifiers,
@@ -1439,7 +1447,7 @@ where
                     //TODO: better calculation of position
                     let col = x / terminal.size().cell_width;
                     let row = y / terminal.size().cell_height;
-                    if is_mouse_mode {
+                    if is_mouse_mode && state.mouse_reported {
                         terminal.report_mouse(
                             event.clone(),
                             &state.modifiers,
@@ -1485,7 +1493,7 @@ where
                         None
                     };
 
-                    if is_mouse_mode {
+                    if is_mouse_mode && state.mouse_reported {
                         if let Some((col, row)) = col_row_opt {
                             terminal.report_mouse(
                                 event.clone(),
@@ -1540,7 +1548,9 @@ where
             }
             Event::Mouse(MouseEvent::WheelScrolled { delta }) => {
                 if let Some(p) = cursor_position.position_in(layout.bounds()) {
-                    if is_mouse_mode {
+                    // Shift bypasses the wheel too, scrolling history / sending arrows
+                    // instead of feeding the app (matches xterm/alacritty).
+                    if is_mouse_mode && !state.modifiers.shift() {
                         let x = p.x - self.padding.left;
                         let y = p.y - self.padding.top;
                         //TODO: better calculation of position
@@ -1932,6 +1942,9 @@ pub struct State {
     scrollbar_rect: Cell<Rectangle<f32>>,
     autoscroll: DragAutoscroll,
     preedit: Option<input_method::Preedit>,
+    // Whether the in-progress button gesture is being reported to the app; latched at
+    // press so a mid-gesture Shift change can't split a reported press from its release.
+    mouse_reported: bool,
 }
 
 impl State {
@@ -1946,6 +1959,7 @@ impl State {
             scrollbar_rect: Cell::new(Rectangle::default()),
             autoscroll: DragAutoscroll::new(AUTOSCROLL_INTERVAL),
             preedit: None,
+            mouse_reported: false,
         }
     }
 }
